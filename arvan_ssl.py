@@ -32,7 +32,6 @@ ARCHIVES = {
     "aarch64": ("arm64", "34d87a6552d69390c4a4560237045c47713a8e148d899e16db0e97040894ed1f"),
 }
 LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
-WEB_SERVICES = {"1": "nginx.service", "2": "apache2.service"}
 CERT_FILES = {"fullchain.pem": "wildcard.crt", "privkey.pem": "wildcard.key"}
 
 
@@ -79,6 +78,8 @@ def ask_yes(prompt, default):
 
 
 def ask_config():
+    print("By continuing, you accept the Let's Encrypt Subscriber Agreement:")
+    print("https://letsencrypt.org/repository/")
     while True:
         value = input("How many domains need a certificate? ").strip()
         if value.isdecimal() and len(value) < 10 and int(value) > 0:
@@ -96,13 +97,6 @@ def ask_config():
         except ValueError as exc:
             print(exc)
 
-    apex = ask_yes("Include the base domain as well as the wildcard?", True)
-    while True:
-        email = input("Let's Encrypt account email: ").strip()
-        if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
-            break
-        print("Enter a valid email address.")
-
     while True:
         value = getpass.getpass("ArvanCloud API key (input hidden): ").strip()
         token = re.sub(r"^apikey\s+", "", value, flags=re.IGNORECASE)
@@ -110,18 +104,7 @@ def ask_config():
             break
         print("Enter your ArvanCloud API key.")
 
-    while True:
-        choice = input("Reload after renewal: [0] None [1] Nginx [2] Apache (default: 0): ").strip() or "0"
-        if choice == "0" or choice in WEB_SERVICES:
-            break
-        print("Enter 0, 1, or 2.")
-
-    print("Let's Encrypt terms: https://letsencrypt.org/repository/")
-    if not ask_yes("Do you accept the Let's Encrypt terms?", False):
-        raise ValueError("Setup canceled.")
-
-    return {"domains": domains, "include_apex": apex, "email": email,
-            "token": token, "web_service": WEB_SERVICES.get(choice)}
+    return {"domains": domains, "token": token}
 
 
 def install_lego():
@@ -181,7 +164,7 @@ WantedBy=timers.target
     subprocess.run([SYSTEMCTL, "is-active", "--quiet", f"{UNIT}.timer"], check=True)
 
 
-def publish(domain, source, reload_marker):
+def publish(domain, source):
     target = STATE / "certs" / domain
     target.mkdir(parents=True, exist_ok=True, mode=0o700)
     current = target / "current"
@@ -189,7 +172,7 @@ def publish(domain, source, reload_marker):
     if current.is_symlink() and all((current / name).is_file()
                                      and (current / name).read_bytes() == data
                                      for name, data in files.items()):
-        return current
+        return target
 
     previous = current.readlink() if current.is_symlink() else None
     version = Path(tempfile.mkdtemp(prefix="pem-", dir=target))
@@ -201,8 +184,6 @@ def publish(domain, source, reload_marker):
         # Check that the PEM files form a valid key/certificate pair before publishing.
         tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         tls.load_cert_chain(version / "fullchain.pem", version / "privkey.pem")
-        if reload_marker is not None:
-            write_atomic(reload_marker, b"pending\n")
         pending.unlink(missing_ok=True)
         pending.symlink_to(version.name, target_is_directory=True)
         pending.replace(current)
@@ -214,12 +195,20 @@ def publish(domain, source, reload_marker):
 
     if previous is not None and previous.name == str(previous) and previous.name.startswith("pem-"):
         shutil.rmtree(target / previous, ignore_errors=True)
-    return current
+    return target
+
+
+def expose_pem_links(target):
+    # Both public paths follow the same certificate version on renewal.
+    for name in CERT_FILES:
+        link = target / name
+        destination = Path("current") / name
+        if link.is_symlink() and link.readlink() == destination:
+            continue
+        link.symlink_to(destination)
 
 
 def refresh(config, lego):
-    service = config["web_service"]
-    marker = STATE / "reload-pending" if service else None
     # Pass the secret only to lego. Keep configuration independent of shell settings.
     env = {
         "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
@@ -232,26 +221,22 @@ def refresh(config, lego):
         print(f"\nChecking certificate for {domain}...", flush=True)
         store = STATE / "acme" / domain
         store.mkdir(parents=True, exist_ok=True, mode=0o700)
-        names = [domain, f"*.{domain}"] if config["include_apex"] else [f"*.{domain}"]
         try:
-            command = [str(lego), "run", "--accept-tos", "--email", config["email"],
+            command = [str(lego), "run", "--accept-tos",
                        "--server", "letsencrypt", "--dns", "arvancloud", "--path", str(store),
-                       "--cert.name", "wildcard", "--domains", ",".join(names),
+                       "--cert.name", "wildcard", "--domains", f"{domain},*.{domain}",
                        "--force-cert-domains", "--reuse-key", "--http-timeout", "30"]
+            if config.get("email"):
+                # Keep using the ACME account created by earlier versions.
+                command.extend(["--email", config["email"]])
             subprocess.run(command, cwd=STATE, env=env, check=True)
-            current = publish(domain, store / "certificates", marker)
-            print(f"Certificate: {current / 'fullchain.pem'}")
-            print(f"Private key: {current / 'privkey.pem'}", flush=True)
+            target = publish(domain, store / "certificates")
+            expose_pem_links(target)
+            print(f"Certificate: {target / 'fullchain.pem'}")
+            print(f"Private key: {target / 'privkey.pem'}", flush=True)
         except (OSError, subprocess.CalledProcessError) as exc:
             errors.append(f"{domain}: {exc}")
 
-    if marker is not None and marker.exists():
-        try:
-            subprocess.run([SYSTEMCTL, "reload", service], check=True)
-            marker.unlink()
-            print(f"Reloaded {service} with the updated certificates.")
-        except (OSError, subprocess.CalledProcessError) as exc:
-            errors.append(f"{service}: {exc}")
     if errors:
         raise ValueError("\n".join(errors))
 
@@ -278,7 +263,7 @@ def main():
         if args.renew and config is None:
             raise ValueError("Run the interactive setup first.")
         if not args.renew and (config is None or ask_yes("Change the saved configuration?", False)):
-            config = ask_config()
+            config = {**(config or {}), **ask_config()}
 
         INSTALL.mkdir(parents=True, exist_ok=True)
         lego = install_lego()
