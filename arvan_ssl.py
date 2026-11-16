@@ -164,9 +164,7 @@ WantedBy=timers.target
     subprocess.run([SYSTEMCTL, "is-active", "--quiet", f"{UNIT}.timer"], check=True)
 
 
-def publish(domain, source):
-    target = STATE / "certs" / domain
-    target.mkdir(parents=True, exist_ok=True, mode=0o700)
+def publish(target, source):
     current = target / "current"
     files = {name: (source / original).read_bytes() for name, original in CERT_FILES.items()}
     if current.is_symlink() and all((current / name).is_file()
@@ -218,6 +216,11 @@ def refresh(config, lego):
     }
     errors = []
     for domain in config["domains"]:
+        target = STATE / "certs" / domain
+        if not target.is_dir():
+            # Only interactive configuration creates managed certificate directories.
+            print(f"Skipping {domain}: certificate directory is missing.", flush=True)
+            continue
         print(f"\nChecking certificate for {domain}...", flush=True)
         store = STATE / "acme" / domain
         store.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -230,7 +233,7 @@ def refresh(config, lego):
                 # Keep using the ACME account created by earlier versions.
                 command.extend(["--email", config["email"]])
             subprocess.run(command, cwd=STATE, env=env, check=True)
-            target = publish(domain, store / "certificates")
+            publish(target, store / "certificates")
             expose_pem_links(target)
             print(f"Certificate: {target / 'fullchain.pem'}")
             print(f"Private key: {target / 'privkey.pem'}", flush=True)
@@ -262,12 +265,18 @@ def main():
         config = json.loads(CONFIG.read_text()) if CONFIG.exists() else None
         if args.renew and config is None:
             raise ValueError("Run the interactive setup first.")
-        if not args.renew and (config is None or ask_yes("Change the saved configuration?", False)):
+        reconfigure = not args.renew and (
+            config is None or ask_yes("Change the saved configuration?", False)
+        )
+        if reconfigure:
             config = {**(config or {}), **ask_config()}
 
         INSTALL.mkdir(parents=True, exist_ok=True)
         lego = install_lego()
         if not args.renew:
+            if reconfigure:
+                for domain in config["domains"]:
+                    (STATE / "certs" / domain).mkdir(parents=True, exist_ok=True, mode=0o700)
             CONFIG.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             write_atomic(CONFIG, json.dumps(config).encode())
             install_timer()
