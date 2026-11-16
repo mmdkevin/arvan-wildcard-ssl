@@ -27,7 +27,7 @@ main() {
     trap 'rm -f -- "$work_dir/arvan_ssl.py"; rmdir -- "$work_dir"' EXIT
     curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
         --connect-timeout 15 --max-time 120 --output "$work_dir/arvan_ssl.py" \
-        "${base_url%/}/arvan_ssl.py"
+        "${base_url%/}/arvan_ssl.py?ts=$(date +%s)"
     as_root /usr/bin/python3 -I "$work_dir/arvan_ssl.py" <&3
 }
 
