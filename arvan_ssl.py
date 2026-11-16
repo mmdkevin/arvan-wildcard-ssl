@@ -21,6 +21,7 @@ from urllib.request import urlopen
 
 
 STATE = Path("/var/lib/arvan-wildcard")
+PASARGUARD_CERTS = Path("/var/lib/pasarguard/arvan-certs")
 CONFIG = Path("/etc/arvan-wildcard/config.json")
 INSTALL = Path("/usr/local/lib/arvan-wildcard")
 UNITS = Path("/etc/systemd/system")
@@ -164,6 +165,37 @@ WantedBy=timers.target
     subprocess.run([SYSTEMCTL, "is-active", "--quiet", f"{UNIT}.timer"], check=True)
 
 
+def certificate_root():
+    local = STATE / "certs"
+    if local.is_symlink():
+        return local.parent / local.readlink()
+    return local
+
+
+def configure_pasarguard_output():
+    local = STATE / "certs"
+    shared = PASARGUARD_CERTS
+    if not shared.parent.is_dir() or local.is_symlink():
+        return
+    if shared.is_symlink() or (shared.exists() and not shared.is_dir()):
+        raise ValueError(f"Invalid PasarGuard certificate directory: {shared}")
+
+    moved = local.exists()
+    if moved:
+        if shared.exists():
+            raise FileExistsError(f"Both certificate directories exist: {local} and {shared}")
+        local.rename(shared)
+    else:
+        shared.mkdir(mode=0o700, exist_ok=True)
+    try:
+        # Preserve host paths while keeping the real PEM files inside the existing Docker mount.
+        local.symlink_to(shared, target_is_directory=True)
+    except OSError:
+        if moved:
+            shared.rename(local)
+        raise
+
+
 def publish(target, source):
     current = target / "current"
     files = {name: (source / original).read_bytes() for name, original in CERT_FILES.items()}
@@ -214,9 +246,10 @@ def refresh(config, lego):
         "ARVANCLOUD_API_KEY": "Apikey " + config["token"],
         "ARVANCLOUD_PROPAGATION_TIMEOUT": "300",
     }
+    root = certificate_root()
     errors = []
     for domain in config["domains"]:
-        target = STATE / "certs" / domain
+        target = root / domain
         if not target.is_dir():
             # Only interactive configuration creates managed certificate directories.
             print(f"Skipping {domain}: certificate directory is missing.", flush=True)
@@ -274,9 +307,10 @@ def main():
         INSTALL.mkdir(parents=True, exist_ok=True)
         lego = install_lego()
         if not args.renew:
+            configure_pasarguard_output()
             if reconfigure:
                 for domain in config["domains"]:
-                    (STATE / "certs" / domain).mkdir(parents=True, exist_ok=True, mode=0o700)
+                    (certificate_root() / domain).mkdir(parents=True, exist_ok=True, mode=0o700)
             CONFIG.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             write_atomic(CONFIG, json.dumps(config).encode())
             install_timer()
